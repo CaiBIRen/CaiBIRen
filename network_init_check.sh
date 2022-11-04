@@ -8,16 +8,6 @@ echo -e "------------${REDCOLOR}[Red is Error]${ENDCOLOR} ; ${GREENCOLOR}[Green 
 
 CONFIGPATH="/etc/network-cvk-agent/config.json"
 
-function funcIsExistListJsonValues() {
-    # $1 file  $2 key
-    VALUE="`awk BEGIN{RS=EOF}'{gsub(/\n/," ");print}' $1 | grep -o "$2[^]]*" | awk -F '[' '{print}'`"
-    if [ -z $value ];then
-        return 1
-    else
-        return 0
-    fi
-}
-
 function funcServiceStatus() 
 
 {
@@ -30,9 +20,21 @@ function funcServiceStatus()
     fi
 }
 
-function funcIsEmpty(){
-    if [ -z $1 ];then
-        echo -e "`printf "%-100s\n" config.json $2 field` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+#1、检查网络服务状态
+echo "=====================检查网络组件状态========================"
+
+funcServiceStatus "network.service"
+funcServiceStatus "openvswitch.service"
+funcServiceStatus "ovn-controller.service"
+funcServiceStatus "frr.service"
+funcServiceStatus "network-cvk-agent.service"
+
+
+#2、检查初始化配置
+function funcIsExistListJsonValues() {
+    # $1 file  $2 key
+    VALUE="`awk BEGIN{RS=EOF}'{gsub(/\n/," ");print}' $1 | grep -o "$2[^]]*" | awk -F '[' '{print $2}'`"
+    if [ -z $value ];then
         return 1
     else
         return 0
@@ -49,7 +51,9 @@ function funcCheckRedis(){
             return 1
         fi
     else
-        if [ funcIsExistListJsonValues ${CONFIGPATH} "sentinaladdrs" = 1 ];then
+        funcIsExistListJsonValues ${CONFIGPATH} "sentinaladdrs"
+        TMP=$?
+        if [ "$TMP" = 1 ];then
             echo -e "`printf "%-100s\n" config.json subscriberconfig field` ${REDCOLOR}[ERROR]${ENDCOLOR}"
             return 1
         fi
@@ -64,20 +68,45 @@ function funcCheckRedis(){
         return 1
     fi
 
-    echo -e "`printf "%-100s\n" check netwrok-cvk-agent config.json` ${GREENCOLOR}[OK]${ENDCOLOR}"
+    echo -e "`printf "%-100s\n" check netwrok-cvk-agent redis status` ${GREENCOLOR}[OK]${ENDCOLOR}"
 }
 
-#1、检查网络服务状态
-echo "=====================检查网络组件状态========================"
+function funcIsEmpty(){
+    if [ -z $1 ];then
+        echo -e "`printf "%-100s\n" config.json $2 field` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+        return 1
+    else
+        return 0
+    fi
+}
 
-funcServiceStatus "network.service"
-funcServiceStatus "openvswitch.service"
-funcServiceStatus "ovn-controller.service"
-funcServiceStatus "frr.service"
-funcServiceStatus "network-cvk-agent.service"
+function funcCheckVpcPeerfilter(){
+    funcIsExistListJsonValues ${CONFIGPATH} "vpcpeerfilternetwork"
+    TMP=$?
+    if [ "$TMP" = 1 ];then
+        echo -e "`printf "%-100s\n" config.json vpcpeerfilternetwork field` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+        return 1
+    fi
+    echo -e "`printf "%-100s\n" check netwrok-cvk-agent vpcpeerfilternetwork field` ${GREENCOLOR}[OK]${ENDCOLOR}"
+}
 
+function fucnCheckHostVtepIPList(){
+    funcIsExistListJsonValues ${CONFIGPATH} "vpcpeerfilternetwork"
+    TMP=$?
+    if [ "$TMP" = 1 ];then
+        echo -e "`printf "%-100s\n" config.json hostvtepiplist field` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+        return 1
+    else
+        local index=1
+        while (-z "`echo $value | awk "{print $index}"`")   ???
+        do
+            HOSTVTEP="`echo $value | awk "{print $index}" | awk -F '"' '{print $2}'`"
+            HOSTVTEPLIST[$index-1]=HOSTVTEP
+        done
+    fi
 
-#2、检查初始化配置
+}
+
 echo "=====================检查服务初始化配置========================"
 
 if [ -f ${CONFIGPATH} ];then
@@ -90,8 +119,9 @@ if [ -f ${CONFIGPATH} ];then
     funcIsEmpty ${AGENT_BGP_AS} "bgpas"
 
     funcCheckRedis
-
-
+    funcCheckVpcPeerfilter
+    funcHostVtepIpList
 else
-    echo -e "network-cvk-agent.service                                          ${REDCOLOR}[/etc/network-cvk-agent/config.json miss]${ENDCOLOR}"
+    echo -e "`printf "%-100s\n" network-cvk-agent.service [/etc/network-cvk-agent/config.json]` ${REDCOLOR}MISS${ENDCOLOR}"
 fi
+
