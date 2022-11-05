@@ -98,16 +98,18 @@ function fucnCheckHostVtepIPList(){
         return 1
     else
         local index=1
-        while (-z "`echo $value | awk "{print $index}"`")   ???
+        while (-n "`echo $value | awk -v awkvar=$index '{print $awkvar}'`")
         do
             HOSTVTEP="`echo $value | awk "{print $index}" | awk -F '"' '{print $2}'`"
             HOSTVTEPLIST[$index-1]=HOSTVTEP
+            let index+=1
         done
     fi
+    echo -e "`printf "%-100s\n" check netwrok-cvk-agent hostvtepiplist field` ${GREENCOLOR}[OK]${ENDCOLOR}"
 
 }
 
-echo "=====================检查服务初始化配置========================"
+echo "=====================检查Network-Cvk-Agent服务初始化配置========================"
 
 if [ -f ${CONFIGPATH} ];then
     #检查配置文件并获取基本信息
@@ -122,6 +124,47 @@ if [ -f ${CONFIGPATH} ];then
     funcCheckVpcPeerfilter
     funcHostVtepIpList
 else
-    echo -e "`printf "%-100s\n" network-cvk-agent.service [/etc/network-cvk-agent/config.json]` ${REDCOLOR}MISS${ENDCOLOR}"
+    echo -e "`printf "%-100s\n" network-cvk-agent.service [/etc/network-cvk-agent/config.json]` ${REDCOLOR}[MISS]${ENDCOLOR}"
 fi
+
+function funcCheckBGPNeighbor(){
+    local index=1
+    local ipaddr=""
+    local status=""
+    local bgpinfo="`echo $1 | sed -n "${index}p"`"
+    while (-n $bgpinfo )
+    do
+        ipaddr="`echo $bgpinfo | awk '{print $1}'`"
+        status="`echo $bgpinfo | awk '{print $2}'`"
+        if [ -z "`ping -c 5 $ipaddr | grep "bytes from"`"];then
+            echo -e "`printf "%-100s\n" Ping BGP neighbor $ipaddr` ${REDCOLOR}[Failed]${ENDCOLOR}"
+            echo -e "`printf "%-100s\n" BGP neighbor $ipaddr status` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+        else
+            echo -e "`printf "%-100s\n" Ping BGP neighbor $ipaddr` ${REDCOLOR}[OK]${ENDCOLOR}"
+            if [[ $status = "Avtive" || $status = "Connect" || $status = "idle" || $status = "opensent" || $status = "openconfirm" ]];then
+                echo -e "`printf "%-100s\n" BGP neighbor $ipaddr status` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+            else
+                echo -e "`printf "%-100s\n" BGP neighbor $ipaddr status` ${GREENCOLOR}[OK]${ENDCOLOR}"
+            fi
+        fi
+        let index+=1
+        bgpinfo="`echo $1 | sed -n "${index}p"`"
+    done
+
+}
+echo "=====================检查BGP邻居状态及连通性========================"
+
+BGPSUMMARY=`vtysh -c "do show bgp l2vpn evpn summary"`
+
+BGP_NEIBORBOR_IP_LIST= echo "BGPSUMMARY" | awk 'NR>=7 {print $1,$10}' | sed '$d' | sed '$d'
+
+funcCheckBGPNeighbor $BGP_NEIBORBOR_IP_LIST
+
+####SoO?????
+
+
+
+
+
+
 
