@@ -103,7 +103,7 @@ function funcCheckHostVtepIPList(){
         while [ -n "`echo "$VALUE" | awk -v awkvar=$index '{print $awkvar}'`" ]
         do
             HOSTVTEP="`echo "$VALUE" | awk -v awkvar=$index '{print $awkvar}' | awk -F '"' '{print $2}'`"
-            HOSTVTEPLIST[$index-1]=${HOSTVTEP}
+            HOSTVTEPLIST[$index-1]=$HOSTVTEP
             let index+=1
         done
     fi
@@ -139,9 +139,9 @@ function funcCheckBGPNeighbor(){
         echo "———————————————————————————————————————————————————————————————"
         ipaddr="`echo $bgpinfo | awk '{print $1}'`"
         status="`echo $bgpinfo | awk '{print $2}'`"
-        if [ -z "`ping -c 5 $ipaddr | grep "bytes from"`" ];then
-            echo -e "`printf "%-100s\n" Ping_BGP_neighbor $ipaddr` ${REDCOLOR}[Failed]${ENDCOLOR}"
-            echo -e "`printf "%-100s\n" Status_BGP_neighbor_$ipaddr status` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+        if [ -z "`ping -c 2 $ipaddr -I br-tun | grep "bytes from"`" ];then
+            echo -e "`printf "%-100s\n" Ping_BGP_neighbor_$ipaddr` ${REDCOLOR}[Failed]${ENDCOLOR}"
+            echo -e "`printf "%-100s\n" Status_BGP_neighbor_$ipaddr` ${REDCOLOR}[ERROR]${ENDCOLOR}"
         else
             echo -e "`printf "%-100s\n" Ping_BGP_neighbor_$ipaddr` ${GREENCOLOR}[OK]${ENDCOLOR}"
             if [[ $status = "Avtive" || $status = "Connect" || $status = "idle" || $status = "opensent" || $status = "openconfirm" ]];then
@@ -157,9 +157,9 @@ function funcCheckBGPNeighbor(){
 }
 
 function funcCheckSoO(){
-    for host in HOSTVTEPLIST
+    for host in ${HOSTVTEPLIST[@]}
     do
-        soo="`vtysh -c "do show bgp l2vpn evpn" | grep -w "10.254.69.2" | grep SoO | tail -n 1`"
+        soo="`vtysh -c "do show bgp l2vpn evpn" | grep -w "$host" | grep SoO | tail -n 1`"
         if [[ -z $soo ]];then
             echo -e "`printf "%-100s\n" SoO_attribute_missing` ${REDCOLOR}[ERROR]${ENDCOLOR}"
             return 1
@@ -168,10 +168,25 @@ function funcCheckSoO(){
     echo -e "`printf "%-100s\n" Check_frr_bgp_SoO` ${GREENCOLOR}[OK]${ENDCOLOR}"
 }
 
-echo "=====================检查BGP邻居状态及连通性========================"
+function funcCheckHostCvkCluster(){
+    for host in ${HOSTVTEPLIST[@]}
+    do
+        echo "———————————————————————————————————————————————————————————————"
+        if [ -z "`ping -c 5 $host -I br-tun | grep "bytes from"`" ];then
+            echo -e "`printf "%-100s\n" Ping_hostcvkcluster_$host` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+        else
+            echo -e "`printf "%-100s\n" Ping_hostcvkcluster_$host` ${GREENCOLOR}[OK]${ENDCOLOR}"
+        fi
+        echo "———————————————————————————————————————————————————————————————"
+    done
+}
+
+echo "=====================检查BGP邻居状态及主机cvk集群连通性========================"
+
+funcCheckHostCvkCluster
 
 if [ -z "`systemctl status frr.service | grep -w "active"`" ];then
-    echo -e "`printf "%-100s\n" frr.service inactive,please repair first` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+    echo -e "`printf "%-100s\n" frr.service_inactive,please_repair_first` ${REDCOLOR}[ERROR]${ENDCOLOR}"
 else 
     BGPSUMMARY=`vtysh -c "do show bgp l2vpn evpn summary"`
 
@@ -179,19 +194,21 @@ else
 
     funcCheckBGPNeighbor
     funcCheckSoO
+fi
 
 function funcCheckBrtun(){
     brtun_ip="`ifconfig br-tun | grep -w inet | awk '{print $2}'`"
-    if [[ $brtun_ip != $vtepip ]];then
+    if [[ $brtun_ip != $AGENT_VTEP_IP ]];then
         echo -e "`printf "%-100s\n" Compare_br-tun_ipaddr_and_network-cvk-agent_config.json_vtep_ip` ${REDCOLOR}[ERROR]${ENDCOLOR}"
     else
         echo -e "`printf "%-100s\n" Compare_br-tun_ipaddr_and_network-cvk-agent_config.json_vtep_ip` ${GREENCOLOR}[OK]${ENDCOLOR}" 
-
+    fi
     brtun_mtu="`ifconfig br-tun | grep -w mtu | awk '{print  $4}'`"
     if [[ $brtun_mtu < 2000 ]];then
         echo -e "`printf "%-100s\n" Check_br-tun_mtu,should_be_2000` ${REDCOLOR}[ERROR]${ENDCOLOR}"
     else
         echo -e "`printf "%-100s\n" Check_br-tun_mtu,should_be_2000` ${GREENCOLOR}[OK]${ENDCOLOR}"
+    fi
 }
 
 function funcCheckBridgeExist(){
@@ -203,45 +220,70 @@ function funcCheckBridgeExist(){
     fi
 }
 
-function funcCheckDpdkInit(){
+function funcCheckDpdkInit(){            #是否还有其他更好的判断方法
     local networkcard
-    networkcard="`ovs-vsctl show | grep  "dpdk-devargs"`"
-    if [[ -z networkcard ]];then
+    devargs="`ovs-vsctl show | grep "Bridge br-tun" -A13 | grep  "error"`"
+    if [[ -n $devargs ]];then
         echo -e "`printf "%-100s\n" OVS_DPDK_STATUS` ${REDCOLOR}[ERROR]${ENDCOLOR}"
     else
-        #详细怎么判断？
         echo -e "`printf "%-100s\n" OVS_DPDK_STATUS` ${GREENCOLOR}[OK]${ENDCOLOR}"
+    fi
 }
-    
-function funcCheckappctlshow(){
 
+function funcCheckappctlshow(){
+    local lines="`echo $1 | wc -l`"
+    for (( i=1;i<=$lines;i++ ));
+    do
+        local bond="`echo $1 | sed -n "$i"p | awk '{print $2}'`"
+        local bondinfo="`ovs-appctl bond/show | grep $bond -A15`"
+        if [[ -n $bondinfo ]];then
+            local slavecards="`echo $bondinfo` | grep ^slave"
+            local card1status="`echo $slavecards | sed -n "1"p | awk '{print $3}'`"
+            local card2status="`echo $slavecards | sed -n "2"p | awk '{print $3}'`"
+            if [[ $card1 = "disable" ]] && [[ $card2 = "disable" ]];then
+                echo -e "`printf "%-100s\n" ovs-appctl_bond/show_$bond` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+            else
+                echo -e "`printf "%-100s\n" ovs-appctl_bond/show_$bond` ${GREENCOLOR}[OK]${ENDCOLOR}"
+            fi
+        fi
+    done
 }
 
 function funcChecktnlneighborshow(){
-    
+    local macaddrs="`ovs-appctl tnl/neigh/show`"
+    local index=3
+    local ovsip=""
+    local ovsmac=""
+    local arpipmac=""
+    local arpip=""
+    local arpmac=""
+    local ovsipmac="`echo "$macaddr" | sed -n "${index}p"`"
+    while [[ -n $ovsipmac ]]
+    do
+        ovsip="`echo $ipmac | awk '{print $1}'`"
+        ovsmac="`echo $ipmac | awk '{print $2}'`"
+        arpmac="`arp -n | grep $ovsip | awk '{print $3}'`"
+        if [[ -z $arpmac ]] || [[ $arpmac != $ovsmac ]];then
+            echo -e "`printf "%-100s\n" ovs_tnl/neigh_mac_and_arp_mac_different_$ovsip` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+        fi
+        let index+=1
+        ovsipmac="`echo "$macaddr" | sed -n "${index}p"`"
+    done
+
+    echo -e "`printf "%-100s\n" Check_ovs_tnl/neigh_mac_and_arp_mac` ${GREENCOLOR}[OK]${ENDCOLOR}"
 } 
-
-function funcCheckbaseflow(){
-
-}
 
 echo "=====================检查网卡以及网桥配置==========================="
 
 funcCheckBrtun
 
 if [ -z "`systemctl status openvswitch.service | grep -w "active"`" ];then
-    echo -e "`printf "%-100s\n" openvswitch.service inactive,please repair first` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+    echo -e "`printf "%-100s\n" openvswitch.service_inactive,please_repair_first` ${REDCOLOR}[ERROR]${ENDCOLOR}"
 else
+    PORTBONDS="`ovs-vsctl show | grep 'bond$'`"
     funcCheckBridgeExist "br-tun"
     funcCheckBridgeExist "business"
-
+    funcChecktnlneighborshow 
+    funcCheckappctlshow "$PORTBONDS"
     funcCheckDpdkInit
-    funcChecktnlneighborshow
-    funcCheckappctlshow
-    funcCheckbaseflow
-
-
-
-
-
-
+fi
