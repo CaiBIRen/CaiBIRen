@@ -4,17 +4,68 @@ ENDCOLOR="\e[0m"
 REDCOLOR="\e[1;31m"
 YELLOWCOLOR="\e[1;33m"
 echo "==Introduction: Check Network Base Config And Managed Information"
-echo -e "------------${REDCOLOR}[Red is Error]${ENDCOLOR} ; ${GREENCOLOR}[Green is OK]${ENDCOLOR} ; ${YELLOWCOLOR}[Yellow is Warning]${ENDCOLOR}------------"
+echo -e "------------${REDCOLOR}[Red is Error]${ENDCOLOR} ; ${GREENCOLOR}[Green is OK]${ENDCOLOR} ; ${YELLOWCOLOR}[Yellow is Warning]${ENDCOLOR}------------\n"
+echo -e "[If you want to skip Ping step, please use ${GREENCOLOR}'--noping'${ENDCOLOR},will reduce running time]\n"
 #================================================================================================================================
-
 CONFIGPATH="/etc/network-cvk-agent/config.json"
 
+declare -A smap
+smap["network-cvk-agent"]=0
+smap["openvswitch"]=0
+smap["ovn-northd"]=0
+smap["ovn-controller"]=0
+smap["frr"]=0
+
+function WriteIni()
+{
+    fid=$1
+    section=$2
+    option=$3
+    value=$4
+    if [ $# -eq 4 ] ; then
+        local src=$(cat $fid | awk '/\['$section'\]/{f=1;next} /\[*\]/{f=0} f')  #先搜寻是否存在option
+        if [ ${#src} -eq 0 ] ;then #没有匹配到section，直接新建并添加内容
+            echo "[$section]" >> $fid
+            echo "    $option=$value"  >> $fid
+            return 0
+        else
+            local src=$(cat -n $fid | awk '/\['$section'\]/{f=1;next} /\[*\]/{f=0} f' | grep $option | grep '=')
+            if [  ${#src} -eq 0 ] ; then #没有对应的 option 直接添加
+                local last=$(cat -n $fid | awk '/\['$section'\]/{f=1;next} /\[*\]/{f=0} f' | tail -n 1)
+                last=$(echo $last | cut -d' ' -f1)
+                sed -i "${last}a\    $option=$value" $fid
+                return 0
+            fi
+            local old_value=$(echo $src | cut -d'=' -f2 |cut -d'#' -f1 | cut -d';' -f1  )
+            local idx=$(echo $src | cut -d' ' -f1)
+            local newcontext="$(cat $fid|sed -n "${idx}p" |  sed "s/$old_value/$value/" |  awk '{gsub(/^\s+|\s+$/, "");print}')"
+            sed -i "${idx}c\    $newcontext" $fid
+            return 0
+        fi
+    fi
+}
+
+function funcCheckFileExists(){
+    if [[ -f  $1 ]];
+    then
+        cat /dev/null > $1
+    else
+        touch $1
+    fi
+}
+
+#$2 nooutput flag
+#active 只能检查到主进程是否正常,无法检测其他子进程
 function funcServiceStatus() 
 {
     service_name=$1
 
     if [ -z "`systemctl status $service_name | grep -w "active"`" ];then
-        echo -e "`printf "%-100s\n" $service_name` ${REDCOLOR}[inactive]${ENDCOLOR}"
+        if [[ -z $2 ]];then
+            echo -e "`printf "%-100s\n" $service_name` ${REDCOLOR}[inactive]${ENDCOLOR}"
+        else
+            smap[$service_name]=1
+        fi
         return 1
     else
         echo -e "`printf "%-100s\n" $service_name` ${GREENCOLOR}[active]${ENDCOLOR}"
@@ -22,7 +73,10 @@ function funcServiceStatus()
     fi
 
 }
+##[监控服务子进程]
+#分两部分：1、监控进程结果 2、主进程日志搜索crash, [ovs]两个进程都有监控 不需要查日志
 
+#1 service_name  2 service_log 3 nooutput flag
 function MonitorProcessStatus(){
     service_name=$1
     Dtmp=`systemctl status $service_name  | grep "monitoring pid" | grep "died"  | awk '{print $2,$5}'`
@@ -30,12 +84,17 @@ function MonitorProcessStatus(){
     #//监控进程反馈
     if [[ -n $Dtmp ]];
     then
+        if [[ -n $3 ]];then
+            smap[$service_name]=1
+            return
+        fi
         local lines=`echo "$Dtmp" | wc -l`
         for (( i=1;i<=$lines;i++ ));
         do
             local process=`echo "$Dtmp" | sed -n "$i"p`
             echo -e "`printf "%-100s\n" "$process"` ${REDCOLOR}[Died]${ENDCOLOR}"
         done
+
     elif [[ -n $Htmp ]];
     then
         local lines=`echo "$Htmp" | wc -l`
@@ -46,39 +105,46 @@ function MonitorProcessStatus(){
         done
     fi
     #//日志中查找
-    if [[ -n $2 ]];
+    if [[  -n $2 ]] && [[ $2 != "_" ]];
     then
         crash=`cat $2 | grep crash`
         process=`echo "$2" | awk -F "/" '{print $5}'`
         if [[ -n $crash ]];
         then
-            echo -e "`printf "%-100s\n" ${process%.*}` ${REDCOLOR}[Crash]${ENDCOLOR}"
+            if [[ -z $3 ]];then
+                echo -e "`printf "%-100s\n" ${process%.*}` ${REDCOLOR}[Crash]${ENDCOLOR}"
+            else
+                smap[$service_name]=1
+                return
+            fi
         else
             echo -e "`printf "%-100s\n" ${process%.*}` ${GREENCOLOR}[OK]${ENDCOLOR}"
         fi
     fi
 }
-
+#1、process 2、service 3、nooutput flag
 function funcCheckPSAUX(){
     local ps=`ps -aux | grep $1 | grep -v "grep"`
     if [[ -z $ps ]];
     then
-        echo -e "`printf "%-100s\n" process:$1` ${REDCOLOR}[Died]${ENDCOLOR}"
+        if [[ -z $3 ]];then    
+            echo -e "`printf "%-100s\n" process:$1` ${REDCOLOR}[Died]${ENDCOLOR}"
+        else
+            smap[$2]=1
+            return
+        fi
     else
         echo -e "`printf "%-100s\n" process:$1` ${GREENCOLOR}[OK]${ENDCOLOR}"
     fi
 }
 
 function funcCheckDB(){
-    if [ -f ${CONFIGPATH} ];
+    if [[ -f ${CONFIGPATH} ]];
     then
         OVNNBDB=`cat $CONFIGPATH | grep -w ovnnbdb | awk -F '"' '{print $4}'`
         OVNSBDB=`cat $CONFIGPATH | grep -w ovnsbdb | awk -F '"' '{print $4}'`
-
-        ls -l $OVNNBDB 1>/dev/null 2>&1 
-        if [[ $? = 2 ]];then
-            echo -e "`printf "%-100s\n" ovnnbdb.sock_is_not_exist:$OVNNBDB` ${REDCOLOR}[ERROR]${ENDCOLOR}"
-        else
+        if [[ -n $OVNNBDB ]];
+        then
             local nbsocknumber=`netstat -xnp | grep $OVNNBDB | wc -l`
             if [[ $nbsocknumber < 3 ]];
             then
@@ -89,10 +155,8 @@ function funcCheckDB(){
             fi
         fi
 
-        ls -l $OVNSBDB 1>/dev/null 2>&1
-        if [[ $? = 2 ]];then
-            echo -e "`printf "%-100s\n" ovnsbdb.sock_is_not_exist:$OVNSBDB` ${REDCOLOR}[ERROR]${ENDCOLOR}"
-        else
+        if [[ -n $OVNSBDB ]];
+        then
             local sbsocknumber=`netstat -xnp | grep $OVNSBDB | wc -l`
             if [[ $nbsocknumber < 3 ]];
             then
@@ -105,27 +169,11 @@ function funcCheckDB(){
     fi
 }
 
-function funcCheck_OVS_Service(){
-    funcServiceStatus "openvswitch.service"
+function funcCheck_ov_service(){
+    funcServiceStatus $1
     if [[ $? = 0 ]];
     then
-        MonitorProcessStatus "openvswitch.service"
-    fi
-}
-
-function funcCheck_Northd_Service(){
-    funcServiceStatus "ovn-northd.service"
-    if [[ $? = 0 ]];
-    then
-        MonitorProcessStatus "ovn-northd.service" "/var/log/ovn/ovn-northd.log"
-    fi
-}
-
-function funcCheck_Controller_Service(){
-    funcServiceStatus "ovn-controller.service"
-    if [[ $? = 0 ]];
-    then
-        MonitorProcessStatus "ovn-northd.service" "/var/log/ovn/ovn-controller.log"
+        MonitorProcessStatus $1 $2 $3
     fi
 }
 
@@ -134,12 +182,24 @@ function funcCheck_Frr_Service(){
     if [[ $? = 0 ]];
     then
         funcCheckPSAUX "/usr/lib/frr/zebra"
-        funcCheckPSAUX "/usr/lib/frr/bgpd"
-        funcCheckPSAUX "/usr/lib/frr/ospfd"
+        funcCheckPSAUX "/usr/lib/frr/bgpd" 
+        funcCheckPSAUX "/usr/lib/frr/ospfd" 
         funcCheckPSAUX "/usr/lib/frr/staticd"
     fi
 }
 
+function funcCheck_Frr_Service_no_output(){
+    funcServiceStatus "frr.service"
+    if [[ $? = 0 ]];
+    then
+        funcCheckPSAUX "/usr/lib/frr/zebra" frr nooutput
+        funcCheckPSAUX "/usr/lib/frr/bgpd" frr nooutput
+        funcCheckPSAUX "/usr/lib/frr/ospfd" frr nooutput
+        funcCheckPSAUX "/usr/lib/frr/staticd" frr nooutput
+    fi
+}
+
+#1、nooutput flag
 function funcCheck_Agent_Service(){
     funcServiceStatus "network-cvk-agent.service"
     if [[ $? = 0 ]];
@@ -147,7 +207,12 @@ function funcCheck_Agent_Service(){
         port=`netstat -anltp | grep 22222`
         if [[ -z $port ]];
         then
-            echo -e "`printf "%-100s\n" port:22222` ${REDCOLOR}[Closed]${ENDCOLOR}"
+            if [[ -z $1 ]];then      
+                echo -e "`printf "%-100s\n" port:22222` ${REDCOLOR}[Closed]${ENDCOLOR}"
+            else
+                smap["network-cvk-agent"]=1
+                return
+            fi
         else
             echo -e "`printf "%-100s\n" port:22222` ${GREENCOLOR}[OK]${ENDCOLOR}"
         fi
@@ -165,7 +230,7 @@ function funcIsExistListJsonValues() {
 }
 
 function funcCheckRedis(){
-    REDISMODE=`cat /etc/network-cvk-agent/config.json | grep -w mode | awk -F '"' '{print $4}'`
+    REDISMODE=`cat $CONFIGPATH | grep -w mode | awk -F '"' '{print $4}'`
     REDISINFO=`cat ${CONFIGPATH} | grep -w address | awk -F '"' '{print $4}'`
     PASSWORD=`cat ${CONFIGPATH} | grep -w password | awk -F '"' '{print $4}'`
     if [[ $REDISMODE = "master" ]];then
@@ -195,13 +260,13 @@ function funcCheckRedis(){
 }
 
 function funcAgentStatus(){
-    AGENTOFFLINE=`cat /etc/network-cvk-agent/config.json | grep -w offline | awk '{print $2}'`
+    AGENTOFFLINE=`cat $CONFIGPATH | grep -w offline | awk '{print $2}'`
     if [ {$AGENTOFFLINE%?} = true ];then
         echo -e "`printf "%-100s\n" check_network-cvk-agent_service_status` ${YELLOWCOLOR}[OFFLINE]${ENDCOLOR}"
         echo "--排查建议:需手动操作退出离线模式"
         return 1
     elif [ -n "`tail -n 200 /var/log/network-cvk-agent/network-cvk-agent.log | grep "enter offline mode"`" ];then
-        echo -e "`printf "%-100s\n" check_network-cvk-agent_service_redis_status` ${YELLOWCOLOR}[OFFLINE]${ENDCOLOR}"
+        echo -e "`printf "%-100s\n" check_network-cvk-agent_service_status` ${YELLOWCOLOR}[OFFLINE]${ENDCOLOR}"
         echo "--排查建议:需手动操作退出离线模式"
         return 1
     elif [ -n "`cat /var/log/network-cvk-agent/network-cvk-agent.log | grep "panic"`" ];then
@@ -218,6 +283,34 @@ function funcIsEmpty(){
         return 1
     else
         return 0
+    fi
+}
+
+function funcCheckDBfield(){
+    OVNNBDB=`cat $CONFIGPATH | grep -w ovnnbdb | awk -F '"' '{print $4}'`
+    OVNSBDB=`cat $CONFIGPATH | grep -w ovnsbdb | awk -F '"' '{print $4}'`
+    if [[ -n $OVNNBDB ]];
+    then
+        ls -l $OVNNBDB 1>/dev/null 2>&1 
+        if [[ $? = 2 ]];then
+            echo -e "`printf "%-100s\n" ovnnbdb.sock_is_not_exist:$OVNNBDB` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+        else
+            echo -e "`printf "%-100s\n" ovnnbdb.sock:$OVNNBDB` ${GREENCOLOR}[OK]${ENDCOLOR}"
+        fi
+    else
+        echo -e "`printf "%-100s\n" config.json_ovnnbdb.sock_field:$OVNNBDB` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+    fi
+
+    if [[ -n $OVNSBDB ]];
+    then
+        ls -l $OVNSBDB 1>/dev/null 2>&1
+        if [[ $? = 2 ]];then
+            echo -e "`printf "%-100s\n" ovnsbdb.sock_is_not_exist:$OVNSBDB` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+        else
+            echo -e "`printf "%-100s\n" ovnsbdb.sock:$OVNNBDB` ${GREENCOLOR}[OK]${ENDCOLOR}"
+        fi
+    else
+        echo -e "`printf "%-100s\n" config.json_ovnsbdb.sock_field:$OVNNBDB` ${REDCOLOR}[ERROR]${ENDCOLOR}"
     fi
 }
 
@@ -331,6 +424,11 @@ function funcCheckFrrRouterId(){
 
 function funcCheckBrtun(){
     brtun_ip="`ifconfig br-tun | grep -w inet | awk '{print $2}'`"
+    if [[ -z $brtun_ip ]];then
+        echo  -e "`printf "%-100s\n" br-tun_not_found` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+        return 1
+    fi
+
     if [[ $brtun_ip != $AGENT_VTEP_IP ]];then
         echo -e "`printf "%-100s\n" Compare_br-tun_ipaddr_and_network-cvk-agent_config.json_vtep_ip` ${REDCOLOR}[ERROR]${ENDCOLOR}"
         echo "--排查建议:br-tun网卡IP变化影响网络服务,请检查br-tun网卡是否改动"
@@ -376,7 +474,7 @@ function funcCheckBridgeType(){
 
 function funcCheckDpdkInit(){            #是否还有其他更好的判断方法
     local networkcard
-    devargs="`ovs-vsctl show | grep "error" | grep -v mi | grep -v tap`"
+    devargs="`ovs-vsctl show | grep "type: dpdk$" -A2 | grep error`"
     if [[ -n $devargs ]];then
         echo -e "`printf "%-100s\n" OVS_DPDK_STATUS` ${REDCOLOR}[ERROR]${ENDCOLOR}"
         echo "--排查建议:网卡加入dpdk报错,请检查网卡状态"
@@ -398,7 +496,7 @@ function funcCheckappctlshow(){
             if [[ $card1status = "disabled" ]] && [[ $card2status = "disabled" ]];then
                 echo -e "`printf "%-100s\n" $bond` ${REDCOLOR}[ERROR]${ENDCOLOR}"
                 echo "--排查建议:$bond:两张子网卡均为disable状态,请查看子网卡状态"
-            elif [[ $card1status = "disabled" ]] || [[ $card2status = "disabled" ]];then
+            elif [[ $card2status = "disabled" ]] || [[ $card2status = "disabled" ]];then
                 echo -e "`printf "%-100s\n" $bond` ${YELLOWCOLOR}[WARNING]${ENDCOLOR}"
                 echo "--排查建议:$bond:其中一张子网卡为disable状态,请查看子网卡状态"
             else
@@ -432,93 +530,138 @@ function funcChecktnlneighborshow(){
     echo -e "`printf "%-100s\n" Check_ovs_tnl/neigh_mac_and_arp_mac` ${GREENCOLOR}[OK]${ENDCOLOR}"
 } 
 
+function funcFulldetection(){
+    #1、检查网络服务状态
+    echo "=====================检查网络组件状态===================================="
 
-#————————————————————————————————————————————————main beginning——————————————————————————————————————————————————————————————
+    echo "———————————————————————————————————————————————————————————————"
+    funcServiceStatus "network.service"
 
+    echo "———————————————————————————————————————————————————————————————"
+    funcCheck_ov_service "openvswitch.service"
 
-#1、检查网络服务状态
-echo "=====================检查网络组件状态===================================="
+    echo "———————————————————————————————————————————————————————————————"
+    funcCheck_ov_service "ovn-northd.service" "/var/log/ovn/ovn-northd.log"
 
-echo "———————————————————————————————————————————————————————————————"
-funcServiceStatus "network.service"
+    echo "———————————————————————————————————————————————————————————————"
+    funcCheck_ov_service "ovn-controller.service" "/var/log/ovn/ovn-controller.log"
 
-echo "———————————————————————————————————————————————————————————————"
-funcCheck_OVS_Service
+    echo "———————————————————————————————————————————————————————————————"
+    funcCheck_Frr_Service
 
-echo "———————————————————————————————————————————————————————————————"
-funcCheck_Northd_Service
+    echo "———————————————————————————————————————————————————————————————"
+    funcCheck_Agent_Service
 
-echo "———————————————————————————————————————————————————————————————"
-funcCheck_Controller_Service
-
-echo "———————————————————————————————————————————————————————————————"
-funcCheck_Frr_Service
-
-echo "———————————————————————————————————————————————————————————————"
-funcCheck_Agent_Service
-
-echo "———————————————————————————————————————————————————————————————"
-funcCheckDB
+    echo "———————————————————————————————————————————————————————————————"
+    funcCheckDB
 
 
 
-#2、检查network-cvk服务配置文件中的内容并且获取相关信息；
-echo "=====================检查network-cvk-agent服务配置====================="
+    #2、检查network-cvk服务配置文件中的内容并且获取相关信息；
+    echo "=====================检查network-cvk-agent服务配置====================="
 
-if [ -f ${CONFIGPATH} ];then
-    #检查配置文件并获取基本信息
-    AGENT_VTEP_IP=`cat /etc/network-cvk-agent/config.json | grep -w vtepip | awk -F '"' '{print $4}'`
-    AGENT_AZ_ID=`cat /etc/network-cvk-agent/config.json | grep -w az_id | awk -F '"' '{print $4}'`
-    AGENT_BGP_AS=`cat /etc/network-cvk-agent/config.json | grep -w bgpas | awk -F '"' '{print $4}'`
-    funcIsEmpty ${AGENT_VTEP_IP} "vtepip"
-    funcIsEmpty ${AGENT_AZ_ID} "az_id"
-    funcIsEmpty ${AGENT_BGP_AS} "bgpas"
+    if [ -f ${CONFIGPATH} ];then
+        #检查配置文件并获取基本信息
+        AGENT_VTEP_IP=`cat $CONFIGPATH | grep -w vtepip | awk -F '"' '{print $4}'`
+        AGENT_AZ_ID=`cat $CONFIGPATH | grep -w az_id | awk -F '"' '{print $4}'`
+        AGENT_BGP_AS=`cat $CONFIGPATH | grep -w bgpas | awk -F '"' '{print $4}'`
+        funcIsEmpty ${AGENT_VTEP_IP} "vtepip"
+        funcIsEmpty ${AGENT_AZ_ID} "az_id"
+        funcIsEmpty ${AGENT_BGP_AS} "bgpas"
 
-    funcCheckRedis
-    funcAgentStatus
-    funcCheckVpcPeerfilter
-    funcCheckHostVtepIPList
+        funcCheckRedis
+        funcAgentStatus
+        funcCheckVpcPeerfilter
+        funcCheckHostVtepIPList
+        funcCheckDBfield
+    else
+        echo -e "`printf "%-100s\n" network-cvk-agent.service [/etc/network-cvk-agent/config.json]` ${REDCOLOR}[MISS]${ENDCOLOR}"
+    fi
+
+
+
+    #3、检查跟其他cvk、设备的连通性以及frr通告的相关字段是否齐全
+    echo "=====================检查BGP邻居状态及主机cvk集群连通性========================"
+
+
+    if [ -z "`systemctl status frr.service | grep -w "active"`" ];then
+        echo -e "`printf "%-100s\n" frr.service_inactive,please_repair_first` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+    else 
+        BGPSUMMARY=`vtysh -c "do show bgp l2vpn evpn summary"`
+
+        BGP_NEIGHBOR_IP_LIST="`echo "$BGPSUMMARY" | awk 'NR>=7 {print $1,$10}' | sed '$d' | sed '$d'`"
+
+        router_id=`vtysh -c "do show running-config" | grep "bgp router-id" | awk '{print $3}'`
+        if [[ -z $1 ]] || [[ $1 != "--noping" ]];then
+            funcCheckHostCvkCluster
+            funcCheckBGPNeighbor
+            funcCheckDeviceConnect
+        fi
+        funcCheckFrrRouterId $router_id
+        funcCheckSoO
+    fi
+
+
+
+    #4、检查ovs网桥以及物理网卡的一些配置
+    echo "=====================检查网卡以及网桥配置=================================="
+
+    funcCheckBrtun
+
+    if [ -z "`systemctl status openvswitch.service | grep -w "active"`" ];then
+        echo -e "`printf "%-100s\n" openvswitch.service_inactive,please_repair_first` ${REDCOLOR}[ERROR]${ENDCOLOR}"
+    else
+        PORTBONDS="`ovs-vsctl show | grep 'bond$'`"
+        funcCheckBridgeExist "br-tun"
+        funcCheckBridgeExist "business"
+        funcCheckBridgeType
+        funcChecktnlneighborshow
+        funcCheckappctlshow "$PORTBONDS"
+        funcCheckDpdkInit
+    fi
+}
+
+function funcCheckBrtun_nooutput(){
+    brtun_ip="`ifconfig br-tun | grep -w inet | awk '{print $2}'`"
+    brtun_mtu="`ifconfig br-tun | grep -w mtu | awk '{print $4}'`"
+    brtun_status="`ifconfig br-tun | head -n 1 | grep UP`"
+    if [[ -z $brtun_status ]];then
+        ifconfig br-tun up
+        brtun_status="down"
+    else
+        brtun_status="up"
+    fi
+    funcCheckFileExists $1
+    WriteIni $1 "br-tun" "vtepip" $brtun_ip
+    WriteIni $1 "br-tun" "mtu" $brtun_mtu
+    WriteIni $1 "br-tun" "status" $brtun_status
+}
+
+function funcCheckService_All(){
+    funcCheck_Agent_Service "nooutput"
+    funcCheck_ov_service "openvswitch.service" "_" "nooutput"
+    funcCheck_Frr_Service_no_output
+    funcCheck_ov_service "ovn-northd.service" "/var/log/ovn/ovn-northd.log" "nooutput"
+    funcCheck_ov_service "ovn-controller.service" "/var/log/ovn/ovn-controller.log" "nooutput"
+
+    funcCheckFileExists $1
+    for srv in ${!smap[@]};
+    do
+        WriteIni $1 $srv "status" ${smap[$srv]}
+    done
+}
+
+
+
+
+#—————————————————————————————————————————————————| Main Beginning |—————————————————————————————————————————————————————————————— 
+
+if [[ $1 = "service" ]] && [[ -n $2 ]];then
+    funcCheckService_All $2
+elif [[ $1 = "br-tun" ]] && [[ -n $2 ]];then
+    funcCheckBrtun_nooutput $2
 else
-    echo -e "`printf "%-100s\n" network-cvk-agent.service [/etc/network-cvk-agent/config.json]` ${REDCOLOR}[MISS]${ENDCOLOR}"
+    funcFulldetection $1
 fi
 
-
-
-#3、检查跟其他cvk、设备的连通性以及frr通告的相关字段是否齐全
-echo "=====================检查BGP邻居状态及主机cvk集群连通性========================"
-
-funcCheckHostCvkCluster
-
-if [ -z "`systemctl status frr.service | grep -w "active"`" ];then
-    echo -e "`printf "%-100s\n" frr.service_inactive,please_repair_first` ${REDCOLOR}[ERROR]${ENDCOLOR}"
-else 
-    BGPSUMMARY=`vtysh -c "do show bgp l2vpn evpn summary"`
-
-    BGP_NEIGHBOR_IP_LIST="`echo "$BGPSUMMARY" | awk 'NR>=7 {print $1,$10}' | sed '$d' | sed '$d'`"
-
-    router_id=`vtysh -c "do show running-config" | grep "bgp router-id" | awk '{print $3}'`
-
-    funcCheckBGPNeighbor
-    funcCheckDeviceConnect
-    funcCheckFrrRouterId $router_id
-    funcCheckSoO
-fi
-
-
-
-#4、检查ovs网桥以及物理网卡的一些配置
-echo "=====================检查网卡以及网桥配置=================================="
-
-funcCheckBrtun
-
-if [ -z "`systemctl status openvswitch.service | grep -w "active"`" ];then
-    echo -e "`printf "%-100s\n" openvswitch.service_inactive,please_repair_first` ${REDCOLOR}[ERROR]${ENDCOLOR}"
-else
-    PORTBONDS="`ovs-vsctl show | grep 'bond$'`"
-    funcCheckBridgeExist "br-tun"
-    funcCheckBridgeExist "business"
-    funcCheckBridgeType
-    funcChecktnlneighborshow
-    funcCheckappctlshow "$PORTBONDS"
-    funcCheckDpdkInit
-fi
+#—————————————————————————————————————————————————| Ending |——————————————————————————————————————————————————————————————————————
